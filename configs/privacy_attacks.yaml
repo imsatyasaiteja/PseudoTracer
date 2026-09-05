@@ -1,0 +1,4 @@
+auxiliary_knowledge:
+  time_bucket_hours: 1
+multi_snapshot:
+  split: midpoint

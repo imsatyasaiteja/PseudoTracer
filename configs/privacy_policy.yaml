@@ -1,0 +1,74 @@
+# Only fields listed here are changed. Every other OCSF field is retained.
+fields:
+  user.uid:
+    class: direct_identifier
+    domain: user_id
+    masked: mask_user
+    hmac: hmac
+  user.name:
+    class: direct_identifier
+    domain: username
+    masked: mask_user
+    hmac: hmac
+  user.email_addr:
+    class: direct_identifier
+    domain: email
+    masked: mask_email
+    hmac: hmac
+    format: email
+  user.display_name:
+    class: direct_identifier
+    domain: display_name
+    masked: mask_user
+    hmac: hmac
+  src_endpoint.uid:
+    class: direct_identifier
+    domain: device_id
+    masked: mask_device
+    hmac: hmac
+  src_endpoint.name:
+    class: direct_identifier
+    domain: device_name
+    masked: mask_device
+    hmac: hmac
+  session.uid:
+    class: direct_identifier
+    domain: session
+    masked: mask_session
+    hmac: hmac
+  metadata.correlation_uid:
+    class: direct_identifier
+    domain: correlation
+    masked: mask_correlation
+    hmac: hmac
+  src_endpoint.ip:
+    class: quasi_identifier
+    domain: ip
+    masked: mask_ip
+    hmac: hmac
+    format: ipv4
+  unmapped.entra.user_agent:
+    class: quasi_identifier
+    domain: user_agent
+    masked: mask_fingerprint
+    hmac: hmac
+  src_endpoint.location.country:
+    class: quasi_identifier
+  time:
+    class: quasi_identifier
+  message:
+    class: direct_identifier
+    masked: redact_message
+    hmac: redact_message
+  status:
+    class: security_context
+  status_code:
+    class: security_context
+  status_detail:
+    class: security_context
+  is_mfa:
+    class: security_context
+  service.uid:
+    class: security_context
+  service.name:
+    class: security_context

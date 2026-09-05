@@ -1,0 +1,16 @@
+scenario: impossible_travel
+incident_id: INC_003
+start: 2026-01-16T09:10:00
+target_user: maya.patel@contoso.example
+first_ip: 203.0.113.21
+first_country: SG
+second_ip: 198.51.100.88
+second_country: BR
+device_id: attacker_travel_laptop
+device_display_name: TRAVEL-LAPTOP-01
+device_type: desktop
+operating_system: Windows 11
+browser: Edge
+user_agent: Mozilla/5.0 impossible-travel-lab
+app_display_name: Code Repository
+gap_minutes: 25

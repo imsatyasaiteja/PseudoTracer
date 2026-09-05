@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/keys/
+data/source/
+tests/
+assets/
+roadmap.txt
+data/runs

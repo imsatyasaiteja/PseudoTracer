@@ -1,0 +1,15 @@
+password_spray:
+  window_minutes: 15
+  min_failures: 7
+  min_users: 5
+mfa_fatigue:
+  window_minutes: 10
+  min_denials: 5
+  session_extension_minutes: 5
+impossible_travel:
+  window_minutes: 60
+  min_risk_score: 80
+credential_compromise:
+  window_minutes: 10
+  min_failures: 3
+  session_extension_minutes: 5

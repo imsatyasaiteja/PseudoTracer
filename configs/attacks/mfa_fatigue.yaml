@@ -1,0 +1,16 @@
+scenario: mfa_fatigue
+incident_id: INC_002
+start: 2026-01-14T21:30:00
+target_user: grace.lee@contoso.example
+attacker_ip: 198.51.100.77
+attacker_country: NG
+device_id: attacker_mfa_phone
+device_display_name: MFA-PHONE-01
+device_type: mobile
+operating_system: Android 14
+browser: Chrome Mobile
+user_agent: Mozilla/5.0 mfa-fatigue-lab
+app_display_name: HR Portal
+prompts: 8
+seconds_between_prompts: 45
+final_success: true
