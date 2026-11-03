@@ -1,8 +1,10 @@
+"""Inject configured sequences and keep their labels in an evaluation sidecar."""
+
 import argparse
 import json
 import random
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -37,16 +39,16 @@ def write_jsonl(path, rows):
             f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def read_config(name):
-    path = CONFIG_DIR / ATTACK_FILES[name]
+def read_config(name, config_dir=CONFIG_DIR):
+    path = config_dir / ATTACK_FILES[name]
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def as_time(value):
-    if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(str(value))
+    value = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    # Injectors use naive UTC internally and serialize a single trailing Z.
+    return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
 
 
 def app_ids(events, app_name):
@@ -61,6 +63,8 @@ def users_from(events):
     for event in events:
         details = event.get("authenticationDetails", [])
         mfa = details[1]["authenticationMethod"] if len(details) > 1 else "pushNotification"
+        normal_device = dict(event["deviceDetail"])
+        normal_device.setdefault("roundTripTimeMs", event.get("roundTripTimeMs") or 75)
         users[event["userPrincipalName"]] = {
             "userId": event["userId"],
             "userPrincipalName": event["userPrincipalName"],
@@ -69,7 +73,7 @@ def users_from(events):
             "identityContext": event.get("identityContext", {}),
             "normalIp": event["ipAddress"],
             "normalCountry": event["location"]["countryOrRegion"],
-            "normalDevice": event["deviceDetail"],
+            "normalDevice": normal_device,
             "normalUserAgent": event["userAgent"],
         }
     return users
@@ -86,6 +90,8 @@ def attacker_device(cfg):
         "displayName": cfg["device_display_name"],
         "operatingSystem": cfg["operating_system"],
         "browser": cfg["browser"],
+        "deviceType": cfg["device_type"],
+        "roundTripTimeMs": cfg.get("round_trip_time_ms", 110 if cfg["device_type"] == "mobile" else 45),
         "isManaged": False,
         "isCompliant": False,
         "trustType": "Unknown",
@@ -151,6 +157,7 @@ def signin_event(user, app_name, app_id, resource_id, timestamp, ip, country, de
         "riskState": "atRisk" if risk_events else "none",
         "riskEventTypes_v2": risk_events,
         "userAgent": user_agent,
+        "roundTripTimeMs": device.get("roundTripTimeMs") or 75,
         "identityContext": user["identityContext"],
         "riskScore": risk,
     }
@@ -398,7 +405,7 @@ def attack_names(value):
     bad = [name for name in names if name not in ATTACK_FILES]
     if bad:
         raise SystemExit(f"Unknown attack: {bad[0]}. Choose from: {', '.join(ATTACK_FILES)}")
-    return names
+    return list(dict.fromkeys(names))
 
 
 def main():
@@ -408,11 +415,14 @@ def main():
     parser.add_argument("--events-in", type=Path, default=EVENTS_IN)
     parser.add_argument("--events-out", type=Path)
     parser.add_argument("--truth-out", type=Path)
+    parser.add_argument("--config-dir", type=Path, default=CONFIG_DIR)
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
     events = read_jsonl(args.events_in)
     users = users_from(events)
+    if not users:
+        raise SystemExit('Attack injection requires at least one background user.')
     injectors = {
         "password_spray": password_spray,
         "mfa_fatigue": mfa_fatigue,
@@ -422,7 +432,12 @@ def main():
 
     names = attack_names(args.attacks)
     for name in names:
-        events.extend(injectors[name](rng, events, users, read_config(name)))
+        cfg = read_config(name, args.config_dir)
+        if cfg.get('target_user') and cfg['target_user'] not in users:
+            print(f"{name}: configured target absent; using {sorted(users)[0]}")
+        if name == 'password_spray' and len(users) < cfg['target_user_count']:
+            print(f"password_spray: only {len(users)} observed users available for {cfg['target_user_count']} targets")
+        events.extend(injectors[name](rng, events, users, cfg))
 
     run_name = "attacks" if names == list(ATTACK_FILES) else "_".join(names)
     events_out = args.events_out or ROOT / "data" / "generated" / f"events_seed{args.seed}_{run_name}.jsonl"

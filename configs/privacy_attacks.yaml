@@ -1,4 +1,6 @@
 auxiliary_knowledge:
   time_bucket_hours: 1
+composite_auxiliary_knowledge:
+  rtt_bucket_ms: 25
 multi_snapshot:
   split: midpoint

@@ -2,11 +2,13 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -58,7 +60,37 @@ def run_command(script, *arguments):
     subprocess.run(command, cwd=ROOT, check=True)
 
 
+def write_json(path, value):
+    """Replace metadata atomically so a dashboard never reads half a file."""
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, indent=2) + '\n', encoding='utf-8')
+    temporary.replace(path)
+
+
+def measured_step(run_dir, costs, script, *arguments):
+    stage = Path(script).stem
+    write_json(run_dir / 'status.json', {'status': 'running', 'stage': stage})
+    start = time.perf_counter()
+    try:
+        run_command(script, *arguments)
+    except KeyboardInterrupt:
+        write_json(run_dir / 'status.json', {'status': 'failed', 'stage': stage, 'error': 'Interrupted by user'})
+        raise
+    except (subprocess.CalledProcessError, OSError) as error:
+        write_json(run_dir / 'status.json', {'status': 'failed', 'stage': stage, 'error': str(error)})
+        raise
+    finally:
+        costs.append({'stage': stage, 'seconds': round(time.perf_counter() - start, 6)})
+        path = run_dir / 'results' / 'cost.csv'
+        path.parent.mkdir(exist_ok=True)
+        with path.open('w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=['stage', 'seconds'])
+            writer.writeheader()
+            writer.writerows(costs)
+
+
 def run_experiment(args):
+    started = time.perf_counter()
     if args.events < 1 or args.users < 1 or args.devices < args.users:
         raise SystemExit("Use at least 1 event and user, with devices greater than or equal to users.")
     selected_arms = selected_names(args.arms, ARMS, "privacy arm")
@@ -85,8 +117,19 @@ def run_experiment(args):
         "utility": run_dir / "results" / "utility.csv",
         "privacy": run_dir / "results" / "privacy.csv",
     }
-    key_path = args.key or KEYS_DIR / f"{run_id}.key"
+    # Interpret explicit paths at the caller's working directory, before child
+    # scripts switch to the repository root.
+    source_path = args.rba_csv.expanduser().resolve()
+    key_path = args.key.expanduser().resolve() if args.key else KEYS_DIR / f"{run_id}.key"
     run_dir.mkdir(parents=True)
+
+    # Freeze the policies used by this run; later edits must not change its record.
+    config_dir = run_dir / 'configs'
+    shutil.copytree(getattr(args, 'config_dir', ROOT / 'configs'), config_dir)
+    costs = []
+
+    def step(script, *arguments):
+        measured_step(run_dir, costs, script, *arguments)
 
     transform_arms = arms if "raw" in selected_arms else f"raw,{arms}"
     manifest = {
@@ -99,36 +142,45 @@ def run_experiment(args):
         "attacks": attacks,
         "arms": arms,
         "generated_arms": transform_arms,
-        "rba_csv": str(args.rba_csv),
+        "rba_csv": str(source_path),
         "key_path": str(key_path),
+        "schema_version": 2,
+        "python_version": sys.version.split()[0],
+        "source_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in sorted((ROOT / 'src').glob('*.py'))},
+        "config_sha256": {path.relative_to(config_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                          for path in sorted(config_dir.rglob('*.yaml'))},
+        "attacker_reference": "Same-run RAW telemetry; strong auxiliary-knowledge baseline",
     }
-    (run_dir / "config.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    write_json(run_dir / "config.json", manifest)
 
-    run_command(
+    step(
         "data_builder.py",
         "--seed", args.seed,
         "--events", args.events,
         "--users", args.users,
         "--devices", args.devices,
-        "--rba-csv", args.rba_csv,
+        "--rba-csv", source_path,
         "--events-out", paths["normal_events"],
         "--truth-out", paths["normal_truth"],
+        "--source-info-out", run_dir / 'data_source.json',
     )
     if attacks == "none":
         shutil.copyfile(paths["normal_events"], paths["events"])
         shutil.copyfile(paths["normal_truth"], paths["truth"])
     else:
-        run_command(
+        step(
             "attack_injector.py",
             "--seed", args.seed,
             "--attacks", attacks,
+            "--config-dir", config_dir / 'attacks',
             "--events-in", paths["normal_events"],
             "--events-out", paths["events"],
             "--truth-out", paths["truth"],
         )
 
-    run_command("ocsf_normalizer.py", "--events-in", paths["events"], "--events-out", paths["normalized"])
-    run_command(
+    step("ocsf_normalizer.py", "--events-in", paths["events"], "--events-out", paths["normalized"])
+    step(
         "transforms.py",
         "--events-in", paths["normalized"],
         "--output-dir", paths["releases"],
@@ -137,15 +189,18 @@ def run_experiment(args):
         # when it was not selected as an experiment result arm.
         "--arms", transform_arms,
         "--run", run_id,
+        "--policy", config_dir / 'privacy_policy.yaml',
+        "--cost-out", run_dir / 'results' / 'transformation_cost.csv',
     )
-    run_command(
+    step(
         "correlation.py",
         "--arms", arms,
         "--run", run_id,
         "--releases-dir", paths["releases"],
         "--incidents-dir", paths["correlated"],
+        "--config", config_dir / 'correlation.yaml',
     )
-    run_command(
+    step(
         "utility_metrics.py",
         "--arms", arms,
         "--run", run_id,
@@ -153,14 +208,15 @@ def run_experiment(args):
         "--incidents-dir", paths["correlated"],
         "--out", paths["utility"],
     )
-    run_command(
+    step(
         "privacy_attacks.py",
         "--arms", arms,
         "--run", run_id,
         "--releases-dir", paths["releases"],
         "--attacks-dir", paths["privacy_attacks"],
+        "--config", config_dir / 'privacy_attacks.yaml',
     )
-    run_command(
+    step(
         "privacy_metrics.py",
         "--arms", arms,
         "--run", run_id,
@@ -168,8 +224,12 @@ def run_experiment(args):
         "--attacks-dir", paths["privacy_attacks"],
         "--truth", paths["truth"],
         "--out", paths["privacy"],
+        "--config", config_dir / 'privacy_attacks.yaml',
     )
+    write_json(run_dir / 'status.json', {'status': 'complete', 'stage': 'complete',
+                                       'elapsed_seconds': round(time.perf_counter() - started, 6)})
     print_summary(run_dir, paths)
+    return run_dir
 
 
 def print_summary(run_dir, paths):
@@ -258,10 +318,12 @@ def add_run_options(parser):
     parser.add_argument("--run-id")
     parser.add_argument("--rba-csv", type=Path, default=ROOT / "data" / "source" / "rba-dataset.csv")
     parser.add_argument("--key", type=Path, help="Existing key to reuse for byte-for-byte HMAC repeatability.")
+    parser.add_argument("--config-dir", type=Path, default=ROOT / 'configs',
+                        help="Policy, rule and attack configurations to snapshot for this run.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Guided runner for PseudoTracer experiments through Phase 5B.")
+    parser = argparse.ArgumentParser(description="Run, list and clean PseudoTracer experiments.")
     commands = parser.add_subparsers(dest="command")
     run_parser = commands.add_parser("run", help="Run one isolated experiment.")
     add_run_options(run_parser)
@@ -276,9 +338,17 @@ def main():
     args = parser.parse_args()
 
     if args.command == "run":
-        run_experiment(args)
+        try:
+            run_experiment(args)
+        except subprocess.CalledProcessError as error:
+            script = Path(error.cmd[1]).name
+            raise SystemExit(f"\nExperiment stopped in {script} (exit {error.returncode}).")
     elif hasattr(args, "func"):
-        args.func(args)
+        try:
+            args.func(args)
+        except subprocess.CalledProcessError as error:
+            script = Path(error.cmd[1]).name
+            raise SystemExit(f"\nExperiment stopped in {script} (exit {error.returncode}).")
     else:
         parser.print_help()
 

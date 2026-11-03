@@ -2,8 +2,10 @@
 
 import argparse
 import copy
+import csv
 import json
 from pathlib import Path
+from time import perf_counter
 
 import yaml
 
@@ -71,13 +73,16 @@ def pseudonym(key, rule, value):
     return token
 
 
-def transform_event(event, arm, policy, key=None, tokens=None):
+def transform_event(event, arm, policy, key=None, tokens=None, owners=None):
     """Return one arm. RAW is an untouched copy; other arms apply the policy."""
+    if arm not in {"raw", "masked", "hmac"}:
+        raise ValueError(f"Unknown privacy arm: {arm}")
     transformed = copy.deepcopy(event)
     if arm == "raw":
         return transformed
 
     tokens = tokens if tokens is not None else {}
+    owners = owners if owners is not None else {}
     for path, rule in policy.items():
         action = rule.get(arm, "retain")
         value = get_field(transformed, path)
@@ -86,9 +91,14 @@ def transform_event(event, arm, policy, key=None, tokens=None):
         if action == "hmac":
             if key is None:
                 raise ValueError("HMAC transformation needs a dataset key")
-            cache_key = rule["domain"], str(value)
+            cache_key = rule["domain"], rule.get("format"), str(value)
             if cache_key not in tokens:
-                tokens[cache_key] = pseudonym(key, rule, value)
+                token = pseudonym(key, rule, value)
+                owner_key = rule["domain"], rule.get("format"), token
+                previous = owners.setdefault(owner_key, str(value))
+                if previous != str(value):
+                    raise ValueError("Pseudonym collision: use opaque HMAC tokens or a different dataset key")
+                tokens[cache_key] = token
             value = tokens[cache_key]
         else:
             value = MASKS[action]
@@ -98,7 +108,8 @@ def transform_event(event, arm, policy, key=None, tokens=None):
 
 def transform_dataset(events, arm, policy, key=None):
     tokens = {}
-    return [transform_event(event, arm, policy, key, tokens) for event in events]
+    owners = {}
+    return [transform_event(event, arm, policy, key, tokens, owners) for event in events]
 
 
 def write_sensitivity_manifest(path, policy):
@@ -126,6 +137,7 @@ def main():
     parser.add_argument("--key", type=Path, default=KEY_PATH)
     parser.add_argument("--arms", default="raw,masked,hmac")
     parser.add_argument("--run", help="Name used in output file names.")
+    parser.add_argument("--cost-out", type=Path, help="Write per-arm transformation timing and release sizes.")
     args = parser.parse_args()
 
     events = read_jsonl(args.events_in)
@@ -136,11 +148,26 @@ def main():
     write_sensitivity_manifest(args.output_dir / "field_sensitivity.json", policy)
 
     stem = args.run or args.events_in.stem.removeprefix("ocsf_authentication_")
+    costs = []
     for arm in arms:
+        started = perf_counter()
         rows = transform_dataset(events, arm, policy, key)
+        elapsed = perf_counter() - started
         path = args.output_dir / f"{arm}_{stem}.jsonl"
         write_jsonl(path, rows)
+        costs.append({"arm": arm, "events": len(rows), "transform_seconds": round(elapsed, 6),
+                      "events_per_second": round(len(rows) / elapsed, 2) if elapsed else None,
+                      "release_bytes": path.stat().st_size})
         print(f"Wrote {len(rows)} {arm.upper()} events to {path}")
+    if args.cost_out:
+        raw_bytes = next((row["release_bytes"] for row in costs if row["arm"] == "raw"), None)
+        for row in costs:
+            row["storage_ratio_to_raw"] = round(row["release_bytes"] / raw_bytes, 4) if raw_bytes else None
+        args.cost_out.parent.mkdir(parents=True, exist_ok=True)
+        with args.cost_out.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=costs[0].keys())
+            writer.writeheader()
+            writer.writerows(costs)
 
 
 if __name__ == "__main__":

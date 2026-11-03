@@ -52,7 +52,22 @@ fields:
     domain: user_agent
     masked: mask_fingerprint
     hmac: hmac
+  unmapped.entra.device_type:
+    class: quasi_identifier
+  unmapped.entra.round_trip_time_ms:
+    class: quasi_identifier
+    domain: round_trip_time
+    masked: mask_fingerprint
+    hmac: hmac
   src_endpoint.location.country:
+    class: quasi_identifier
+  src_endpoint.os:
+    class: quasi_identifier
+  unmapped.entra.device_browser:
+    class: quasi_identifier
+  unmapped.entra.identity_context.department:
+    class: quasi_identifier
+  unmapped.entra.identity_context.role:
     class: quasi_identifier
   time:
     class: quasi_identifier

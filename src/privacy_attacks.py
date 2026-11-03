@@ -41,22 +41,26 @@ def user_token(event):
 
 
 def ranked_counts(events):
-    counts = Counter(user_token(event) for event in events)
+    counts = Counter(user_token(event) for event in events if user_token(event))
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
 
 
 def frequency_attack(raw_events, release_events):
-    """Guess identities by matching most-active-user ranks without a key."""
+    """Match activity ranks; abstain where tied ranks do not identify one user."""
     raw_ranks = ranked_counts(raw_events)
     release_ranks = ranked_counts(release_events)
+    raw_ties = Counter(count for _, count in raw_ranks)
+    release_ties = Counter(count for _, count in release_ranks)
     guesses = []
     for index, (token, count) in enumerate(release_ranks[: len(raw_ranks)]):
         guessed_user, reference_count = raw_ranks[index]
+        candidates = max(raw_ties[reference_count], release_ties[count])
         guesses.append(
             {
                 "attack": "frequency",
                 "release_entity": token,
-                "guessed_user_id": guessed_user,
+                "guessed_user_id": guessed_user if candidates == 1 else None,
+                "candidate_count": candidates,
                 "release_count": count,
                 "reference_count": reference_count,
             }
@@ -64,36 +68,75 @@ def frequency_attack(raw_events, release_events):
     return guesses
 
 
+def value_at(event, path, default="unknown"):
+    value = event
+    for part in path.split("."):
+        if not isinstance(value, dict):
+            return default
+        value = value.get(part)
+    return value if value not in {None, ""} else default
+
+
+def ip_prefix(value):
+    parts = str(value).split(".")
+    return ".".join(parts[:3]) if len(parts) == 4 else str(value)
+
+
+def rtt_bucket(value, bucket_ms):
+    if bucket_ms <= 0:
+        raise ValueError("RTT bucket size must be positive")
+    try:
+        return int(float(value) // bucket_ms) * bucket_ms
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def signature(event, bucket_hours):
+    if bucket_hours <= 0 or bucket_hours > 24:
+        raise ValueError("Time bucket size must be between 0 and 24 hours")
     country = event["src_endpoint"].get("location", {}).get("country")
     app = event["service"].get("name")
-    hour = (event["time"] // (bucket_hours * 60 * 60 * 1000)) % 24
+    hour = (event["time"] % (24 * 60 * 60 * 1000)) // (bucket_hours * 60 * 60 * 1000)
     return country, app, hour
 
 
-def profiles(events, bucket_hours):
+def composite_signature(event, bucket_hours, rtt_bucket_ms):
+    """Fields that become identifying when observed together, not in isolation."""
+    return signature(event, bucket_hours) + (
+        value_at(event, "unmapped.entra.device_type"),
+        value_at(event, "unmapped.entra.user_agent"),
+        ip_prefix(value_at(event, "src_endpoint.ip")),
+        rtt_bucket(value_at(event, "unmapped.entra.round_trip_time_ms"), rtt_bucket_ms),
+    )
+
+
+def profiles(events, make_signature):
     result = defaultdict(set)
     for event in events:
-        result[user_token(event)].add(signature(event, bucket_hours))
+        if user_token(event):
+            result[user_token(event)].add(make_signature(event))
     return result
 
 
-def auxiliary_knowledge_attack(raw_events, release_events, bucket_hours):
-    """Match retained location, application, and time-of-day patterns to a reference set."""
-    reference = profiles(raw_events, bucket_hours)
+def profile_matching_attack(raw_events, release_events, make_signature, attack):
+    """Use a signature index instead of comparing every pair of user profiles."""
+    users_by_signature = defaultdict(set)
+    for user_id, known in profiles(raw_events, make_signature).items():
+        for item in known:
+            users_by_signature[item].add(user_id)
     guesses = []
-    for token, observed in profiles(release_events, bucket_hours).items():
-        candidates = sorted(
-            reference,
-            key=lambda user_id: (-len(observed & reference[user_id]), user_id),
-        )
-        guessed_user = candidates[0]
-        overlap = len(observed & reference[guessed_user])
+    for token, observed in profiles(release_events, make_signature).items():
+        scores = Counter()
+        for item in observed:
+            scores.update(users_by_signature.get(item, ()))
+        overlap = max(scores.values(), default=0)
+        candidates = [user_id for user_id, score in scores.items() if score == overlap]
         guesses.append(
             {
-                "attack": "auxiliary_knowledge",
+                "attack": attack,
                 "release_entity": token,
-                "guessed_user_id": guessed_user,
+                "guessed_user_id": candidates[0] if len(candidates) == 1 else None,
+                "candidate_count": len(candidates),
                 "matching_signatures": overlap,
                 "observed_signatures": len(observed),
             }
@@ -101,11 +144,34 @@ def auxiliary_knowledge_attack(raw_events, release_events, bucket_hours):
     return guesses
 
 
+def auxiliary_knowledge_attack(raw_events, release_events, bucket_hours):
+    """Match retained location, application, and time-of-day patterns to a reference set."""
+    return profile_matching_attack(
+        raw_events,
+        release_events,
+        lambda event: signature(event, bucket_hours),
+        "auxiliary_knowledge",
+    )
+
+
+def composite_auxiliary_attack(raw_events, release_events, bucket_hours, rtt_bucket_ms):
+    return profile_matching_attack(
+        raw_events,
+        release_events,
+        lambda event: composite_signature(event, bucket_hours, rtt_bucket_ms),
+        "composite_auxiliary_knowledge",
+    )
+
+
 def snapshots(events, split="midpoint"):
     if split != "midpoint":
         raise ValueError("Only midpoint snapshot splitting is supported")
     ordered = sorted(events, key=lambda event: event["time"])
-    cutoff = ordered[len(ordered) // 2]["time"]
+    if not ordered:
+        return [], []
+    # Do not split simultaneous events across snapshots. For two distinct
+    # timestamps the earlier event belongs to the first snapshot.
+    cutoff = ordered[(len(ordered) - 1) // 2]["time"]
     first = [event for event in ordered if event["time"] <= cutoff]
     second = [event for event in ordered if event["time"] > cutoff]
     return first, second
@@ -134,10 +200,17 @@ def multi_snapshot_attack(events, split):
 
 
 def run_attacks(raw_events, release_events, cfg):
+    """A strong baseline: identity-labelled profiles from this same dataset.
+
+    Attacks use counts/signatures, not event IDs, the key, or ground-truth
+    labels. These rates do not estimate risk with independent auxiliary data.
+    """
     bucket_hours = cfg["auxiliary_knowledge"]["time_bucket_hours"]
+    rtt_bucket_ms = cfg["composite_auxiliary_knowledge"]["rtt_bucket_ms"]
     return (
         frequency_attack(raw_events, release_events)
         + auxiliary_knowledge_attack(raw_events, release_events, bucket_hours)
+        + composite_auxiliary_attack(raw_events, release_events, bucket_hours, rtt_bucket_ms)
         + multi_snapshot_attack(release_events, cfg["multi_snapshot"]["split"])
     )
 

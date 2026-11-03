@@ -3,7 +3,7 @@
 import argparse
 import csv
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -32,64 +32,101 @@ def event_ids(incidents):
     return {event_id for incident in incidents for event_id in incident["event_ids"]}
 
 
-def entity_link_accuracy(incidents, truth):
+def entity_link_counts(incidents, truth):
+    """Count matching user pairs without materializing every pair."""
     truth_by_event = {row["event_id"]: row for row in truth}
     correct = total = 0
     for incident in incidents:
         if "user_id" not in incident["entities"]:
             continue
-        users = [truth_by_event[event_id]["true_user_id"] for event_id in incident["event_ids"] if event_id in truth_by_event]
-        for index, user_id in enumerate(users):
-            for other in users[index + 1 :]:
-                total += 1
-                correct += user_id == other
+        users = Counter(truth_by_event[event_id]["true_user_id"] for event_id in set(incident["event_ids"]) if event_id in truth_by_event)
+        count = sum(users.values())
+        total += count * (count - 1) // 2
+        correct += sum(count * (count - 1) // 2 for count in users.values())
+    return correct, total
+
+
+def entity_link_accuracy(incidents, truth):
+    correct, total = entity_link_counts(incidents, truth)
     return ratio(correct, total) if total else None
 
 
-def timeline_and_detection(incidents, truth):
+def timeline_and_detection(incidents, truth, with_counts=False):
     by_incident = defaultdict(list)
     for row in truth:
         if row["is_attack"]:
             by_incident[row["incident_id"]].append(row)
 
+    by_event = defaultdict(list)
+    for item in incidents:
+        for event_id in set(item["event_ids"]):
+            by_event[item["scenario"], event_id].append(item["detected_at"])
+
     completeness = []
     delays = []
     detected = 0
+    covered_events = total_events = 0
     for rows in by_incident.values():
-        scenario = rows[0]["scenario"]
-        truth_ids = {row["event_id"] for row in rows}
-        matches = [item for item in incidents if item["scenario"] == scenario and truth_ids.intersection(item["event_ids"])]
-        covered = set().union(*(set(item["event_ids"]) for item in matches)) if matches else set()
-        completeness.append(ratio(len(truth_ids & covered), len(truth_ids)))
-        if matches:
+        covered = 0
+        detections = []
+        for row in rows:
+            matches = by_event[row["scenario"], row["event_id"]]
+            covered += bool(matches)
+            # A later session extension cannot make an earlier alert detect an attack.
+            detections.extend(time for time in matches if time >= timestamp_ms(row["timestamp"]))
+        completeness.append(covered / len(rows))
+        covered_events += covered
+        total_events += len(rows)
+        if detections:
             detected += 1
             first_truth = min(timestamp_ms(row["timestamp"]) for row in rows)
-            delays.append(max(0, min(item["detected_at"] for item in matches) - first_truth) / 1000)
-    return ratio(sum(completeness), len(completeness)), round(sum(delays) / len(delays), 2) if delays else None, detected
+            delays.append((min(detections) - first_truth) / 1000)
+    coverage = ratio(sum(completeness), len(completeness)) if completeness else None
+    result = (coverage, round(sum(delays) / len(delays), 2) if delays else None, detected)
+    return result + (covered_events, total_events) if with_counts else result
 
 
 def score(arm, incidents, truth, scenario="all"):
+    """Score unique flagged events; 'all' measures attack versus background.
+
+    Scenario rows require the correct rule. Empty denominators are left blank.
+    """
     attack_truth = [row for row in truth if row["is_attack"] and (scenario == "all" or row["scenario"] == scenario)]
     selected = [item for item in incidents if scenario == "all" or item["scenario"] == scenario]
     actual = {row["event_id"] for row in attack_truth}
     predicted = event_ids(selected)
     true_positive = len(actual & predicted)
-    precision = ratio(true_positive, len(predicted))
-    recall = ratio(true_positive, len(actual))
-    f1 = ratio(2 * precision * recall, precision + recall)
-    completeness, delay, detected = timeline_and_detection(selected, attack_truth)
-    link_accuracy = entity_link_accuracy(selected, truth)
+    false_positive = len(predicted - actual)
+    false_negative = len(actual - predicted)
+    negatives = len({row["event_id"] for row in truth} - actual)
+    actual_incidents = len({row["incident_id"] for row in attack_truth})
+    completeness, delay, detected, covered, timeline_total = timeline_and_detection(selected, attack_truth, with_counts=True)
+    linked_correct, linked_total = entity_link_counts(selected, truth)
+    link_accuracy = ratio(linked_correct, linked_total) if linked_total else None
     return {
         "arm": arm,
         "scenario": scenario,
         "predicted_incidents": len(selected),
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
+        "attack_events": len(actual),
+        "predicted_events": len(predicted),
+        "true_positive_events": true_positive,
+        "false_positive_events": false_positive,
+        "false_negative_events": false_negative,
+        "normal_events": negatives,
+        "entity_link_correct_pairs": linked_correct,
+        "entity_link_total_pairs": linked_total,
+        "timeline_covered_events": covered,
+        "timeline_total_events": timeline_total,
+        "precision": ratio(true_positive, len(predicted)) if predicted else "",
+        "recall": ratio(true_positive, len(actual)) if actual else "",
+        "f1": ratio(2 * true_positive, len(predicted) + len(actual)) if predicted or actual else "",
+        "false_positive_rate": ratio(false_positive, negatives) if negatives else "",
         "entity_link_accuracy": link_accuracy if link_accuracy is not None else "",
-        "timeline_completeness": completeness,
+        "timeline_completeness": completeness if completeness is not None else "",
         "mean_time_to_detect_seconds": delay if delay is not None else "",
         "incidents_detected": detected,
+        "actual_incidents": actual_incidents,
+        "incident_recall": ratio(detected, actual_incidents) if actual_incidents else "",
     }
 
 

@@ -1,4 +1,4 @@
-"""Convert Phase 1 Entra-like sign-in events into OCSF Authentication events."""
+"""Convert Entra-like sign-in events into OCSF Authentication events."""
 
 import argparse
 import json
@@ -25,7 +25,10 @@ def write_jsonl(path, rows):
 
 
 def epoch_ms(value):
-    return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return int(timestamp.timestamp() * 1000)
 
 
 def os_detail(value):
@@ -98,7 +101,7 @@ def normalize(event):
             "correlation_uid": event.get("correlationId"),
             "product": {"name": "Microsoft Entra ID", "vendor_name": "Microsoft"},
             "log_provider": "PseudoTracer",
-            "original_time": time,
+            "original_time": event['createdDateTime'],
             "tenant_uid": "contoso.example",
             "version": OCSF_VERSION,
         },
@@ -128,6 +131,7 @@ def normalize(event):
                 "client_app_used": event.get("clientAppUsed"),
                 "conditional_access_status": event.get("conditionalAccessStatus"),
                 "device_browser": event.get("deviceDetail", {}).get("browser"),
+                "device_type": event.get("deviceDetail", {}).get("deviceType", "unknown"),
                 "device_compliant": event.get("deviceDetail", {}).get("isCompliant"),
                 "device_managed": event.get("deviceDetail", {}).get("isManaged"),
                 "device_trust_type": event.get("deviceDetail", {}).get("trustType"),
@@ -136,6 +140,7 @@ def normalize(event):
                 "risk_level_aggregated": event.get("riskLevelAggregated"),
                 "risk_score": event.get("riskScore"),
                 "risk_state": event.get("riskState"),
+                "round_trip_time_ms": event.get("roundTripTimeMs"),
                 "user_agent": event.get("userAgent"),
             }
         },
@@ -145,10 +150,13 @@ def normalize(event):
 
 def validate(events):
     required = {"time", "metadata", "service", "session", "src_endpoint", "user"}
+    seen = set()
     for event in events:
         missing = required - event.keys()
-        if missing or event["class_uid"] != 3002 or not event["metadata"]["uid"]:
+        uid = event.get('metadata', {}).get('uid')
+        if missing or event.get("class_uid") != 3002 or not uid or uid in seen:
             raise ValueError(f"Invalid OCSF event: {event.get('metadata', {}).get('uid')}")
+        seen.add(uid)
 
 
 def main():

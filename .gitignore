@@ -2,7 +2,8 @@ __pycache__/
 *.pyc
 data/keys/
 data/source/
-tests/
-assets/
-roadmap.txt
+assets/*
 data/runs
+data/studies/
+docs
+tests

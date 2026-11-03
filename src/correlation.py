@@ -2,7 +2,8 @@
 
 import argparse
 import json
-from collections import defaultdict
+from bisect import bisect_left, bisect_right
+from collections import Counter, OrderedDict, defaultdict, deque
 from pathlib import Path
 
 import yaml
@@ -45,16 +46,34 @@ def group_by(events, key):
     return groups
 
 
-def time_windows(events, minutes):
-    """Split a sorted group whenever it extends past the rule's time window."""
+def threshold_windows(events, minutes, min_events, min_users=1):
+    """Merge overlapping qualifying windows into one incident per burst."""
     window_ms = minutes * 60 * 1000
-    start = 0
+    users = Counter()
+    left = 0
+    active = None
     for index, event in enumerate(events):
-        if event["time"] - events[start]["time"] > window_ms:
-            yield events[start:index]
-            start = index
-    if events:
-        yield events[start:]
+        users[event["user"].get("uid")] += 1
+        while event["time"] - events[left]["time"] > window_ms:
+            user = events[left]["user"].get("uid")
+            users[user] -= 1
+            if not users[user]:
+                del users[user]
+            left += 1
+        known_users = len(users) - (None in users)
+        if index - left + 1 < min_events or known_users < min_users:
+            continue
+        if active is not None and left > active[1]:
+            start, end, detected_at = active
+            yield events[start:end + 1], detected_at
+            active = None
+        if active is None:
+            active = [left, index, event["time"]]
+        else:
+            active[1] = index
+    if active is not None:
+        start, end, detected_at = active
+        yield events[start:end + 1], detected_at
 
 
 def incident(scenario, rule, events, detected_at, entities):
@@ -69,93 +88,92 @@ def incident(scenario, rule, events, detected_at, entities):
     }
 
 
-def extend_session(events, base, session_id, minutes):
+def extend_session(sessions, base, session_id, minutes):
     """Add later events from the same session to complete an incident timeline."""
     if not session_id:
         return base
     end_time = base[-1]["time"] + minutes * 60 * 1000
     event_ids = {event_id(event) for event in base}
-    extra = [
-        event
-        for event in events
-        if event["session"].get("uid") == session_id and base[0]["time"] <= event["time"] <= end_time
-    ]
+    group = sessions.get(session_id, [])
+    start = bisect_left(group, base[0]["time"], key=lambda event: event["time"])
+    end = bisect_right(group, end_time, key=lambda event: event["time"])
+    extra = group[start:end]
     return sorted(base + [event for event in extra if event_id(event) not in event_ids], key=lambda event: event["time"])
 
 
 def password_sprays(events, cfg):
-    failures = [event for event in events if event["status_id"] == 2]
+    failures = [event for event in events if event["status_code"] == "50126"]
     incidents = []
     for ip, group in group_by(failures, lambda event: event["src_endpoint"].get("ip")).items():
-        for window in time_windows(group, cfg["window_minutes"]):
-            users = set()
-            for index, event in enumerate(window, start=1):
-                users.add(event["user"].get("uid"))
-                if index >= cfg["min_failures"] and len(users) >= cfg["min_users"]:
-                    incidents.append(incident("password_spray", "same_ip_many_users", window, event["time"], {"source_ip": ip}))
-                    break
+        for window, detected_at in threshold_windows(group, cfg["window_minutes"], cfg["min_failures"], cfg["min_users"]):
+            incidents.append(incident("password_spray", "same_ip_many_users", window, detected_at, {"source_ip": ip}))
     return incidents
 
 
-def mfa_fatigue(events, cfg):
+def mfa_fatigue(events, cfg, sessions):
     denials = [event for event in events if event["status_code"] == "500121"]
     incidents = []
     for user_id, group in group_by(denials, lambda event: event["user"].get("uid")).items():
-        for window in time_windows(group, cfg["window_minutes"]):
-            if len(window) >= cfg["min_denials"]:
-                trigger = window[cfg["min_denials"] - 1]
-                timeline = extend_session(events, window, trigger["session"].get("uid"), cfg["session_extension_minutes"])
-                incidents.append(incident("mfa_fatigue", "repeated_mfa_denials", timeline, trigger["time"], {"user_id": user_id}))
+        for window, detected_at in threshold_windows(group, cfg["window_minutes"], cfg["min_denials"]):
+            trigger = next(event for event in window if event["time"] == detected_at)
+            timeline = extend_session(sessions, window, trigger["session"].get("uid"), cfg["session_extension_minutes"])
+            incidents.append(incident("mfa_fatigue", "repeated_mfa_denials", timeline, detected_at, {"user_id": user_id}))
     return incidents
 
 
 def impossible_travel(events, cfg):
+    """Flag high-risk country changes; this is not a distance/speed calculation."""
     successes = [event for event in events if event["status_id"] == 1]
     limit_ms = cfg["window_minutes"] * 60 * 1000
     incidents = []
     for user_id, group in group_by(successes, lambda event: event["user"].get("uid")).items():
-        for index, current in enumerate(group):
+        recent = OrderedDict()
+        for current in group:
             country = current["src_endpoint"].get("location", {}).get("country")
             risk = current.get("unmapped", {}).get("entra", {}).get("risk_score", 0)
-            correlation_id = current["metadata"].get("correlation_uid")
-            if not correlation_id or risk < cfg["min_risk_score"]:
+            if not country:
                 continue
-            for previous in reversed(group[:index]):
-                if current["time"] - previous["time"] > limit_ms:
-                    break
-                previous_country = previous["src_endpoint"].get("location", {}).get("country")
-                if country and previous_country and country != previous_country and previous["metadata"].get("correlation_uid") == correlation_id:
-                    incidents.append(incident("impossible_travel", "same_user_transaction_different_country", [previous, current], current["time"], {"user_id": user_id}))
-                    break
+            while recent and current["time"] - next(iter(recent.values()))["time"] > limit_ms:
+                recent.popitem(last=False)
+            if risk >= cfg["min_risk_score"]:
+                # One latest event per country makes this search at most two steps.
+                previous = next((event for other, event in reversed(recent.items()) if other != country), None)
+                if previous is not None:
+                    incidents.append(incident("impossible_travel", "same_user_different_country", [previous, current], current["time"], {"user_id": user_id}))
+            recent.pop(country, None)
+            recent[country] = current
     return incidents
 
 
-def credential_compromises(events, cfg):
+def credential_compromises(events, cfg, sessions):
     incidents = []
-    key = lambda event: (event["user"].get("uid"), event["src_endpoint"].get("ip"))
+    known = [event for event in events if event["user"].get("uid") and event["src_endpoint"].get("ip")]
+    key = lambda event: (event["user"]["uid"], event["src_endpoint"]["ip"])
     limit_ms = cfg["window_minutes"] * 60 * 1000
-    for (user_id, ip), group in group_by(events, key).items():
-        failures = []
+    for (user_id, ip), group in group_by(known, key).items():
+        failures = deque()
         for event in group:
+            while failures and event["time"] - failures[0]["time"] > limit_ms:
+                failures.popleft()
             if event["status_code"] == "50126":
                 failures.append(event)
             elif event["status_id"] == 1:
-                failures = [failure for failure in failures if event["time"] - failure["time"] <= limit_ms]
                 if len(failures) >= cfg["min_failures"]:
-                    base = failures + [event]
-                    timeline = extend_session(events, base, event["session"].get("uid"), cfg["session_extension_minutes"])
+                    base = list(failures) + [event]
+                    timeline = extend_session(sessions, base, event["session"].get("uid"), cfg["session_extension_minutes"])
                     incidents.append(incident("credential_compromise", "failures_then_success", timeline, event["time"], {"user_id": user_id, "source_ip": ip}))
-                    failures = []
+                failures.clear()
     return incidents
 
 
 def correlate(events, cfg):
     events = sorted(events, key=lambda event: event["time"])
+    sessions = group_by(events, lambda event: event["session"].get("uid"))
     incidents = []
     incidents.extend(password_sprays(events, cfg["password_spray"]))
-    incidents.extend(mfa_fatigue(events, cfg["mfa_fatigue"]))
+    incidents.extend(mfa_fatigue(events, cfg["mfa_fatigue"], sessions))
     incidents.extend(impossible_travel(events, cfg["impossible_travel"]))
-    incidents.extend(credential_compromises(events, cfg["credential_compromise"]))
+    incidents.extend(credential_compromises(events, cfg["credential_compromise"], sessions))
     incidents.sort(key=lambda item: (item["detected_at"], item["scenario"]))
     for index, item in enumerate(incidents, start=1):
         item["incident_id"] = f"det_{index:04d}"

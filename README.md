@@ -1,123 +1,111 @@
 # PseudoTracer
 
-PseudoTracer is a Privacy-Preserving IAM telemetry research prototype. It builds
-Entra-like sign-in events from a sample of [RBA dataset](https://www.kaggle.com/datasets/dasgroup/rba-dataset/data), injects configured attacks,
-normalizes them to OCSF, applies privacy transformations, and evaluates utility
-and privacy through Phase 5B.
+PseudoTracer compares correlation utility and privacy risk across RAW, MASKED and
+HMAC versions of the same IAM event stream. It generates sign-ins, injects four
+attack scenarios, normalizes events to OCSF Authentication records, and scores
+correlation and privacy attacks against separate ground truth.
 
-## Quick Start
+## Setup
 
-Run a default experiment:
+Requires Python 3.10+ and Node.js with npm. From the repository root:
 
 ```powershell
-python src\experiment_cli.py interactive
+python -m pip install -r requirements.txt
+npm --prefix ui ci
 ```
 
-Or run a custom experiment directly:
+The optional RBA input belongs at `data/source/rba-dataset.csv`.
+If it is missing or unusable, the generator uses synthetic data and records that
+choice in `data_source.json`.
+
+## Dashboard
+
+Start the API from the repository root:
 
 ```powershell
-python src\experiment_cli.py run --seed 42 --events 3000 --attacks all
+python ui/server.py
 ```
 
-Each command creates a new isolated directory under `data/runs/`. Existing runs
-are never overwritten.
-
-## Common Experiments
-
-Use a different seed or normal-event count:
+In a second terminal:
 
 ```powershell
-python src\experiment_cli.py run --seed 7 --events 5000
+cd ui
+npm run dev -- --port 5173 --strictPort
 ```
 
-Choose attack scenarios. Available attack scenarios are `password_spray`, `mfa_fatigue`,
-`impossible_travel`, and `credential_compromise`:
+Open http://127.0.0.1:5173. Vite forwards API requests to port 8765; keep both
+terminals running. Restart the API after Python changes, when no experiment is
+running. The server is intended for local use. `npm run preview` alone does not
+connect the API. If PowerShell blocks `npm.ps1`, use `npm.cmd` instead.
+
+The Guide tab covers filters, measurements and the privacy policy. Analyze compares
+saved results and replays detector thresholds against the selected experiment.
+
+## Command line
 
 ```powershell
-python src\experiment_cli.py run --seed 7 --events 2500 --attacks password_spray,mfa_fatigue
+python src/experiment_cli.py interactive
+python src/experiment_cli.py run --seed 42 --events 3000 --users 20 --devices 30 --attacks all
+python src/experiment_cli.py list
 ```
 
-Run normal traffic only:
+Use `--attacks none` for a control, or a comma-separated selection of
+`password_spray`, `mfa_fatigue`, `impossible_travel`, and `credential_compromise`.
+`--arms` selects `raw,masked,hmac`. Devices must be at least the user count.
+
+Use `--config-dir` to run with edited policy, rule or attack YAML files. Each run
+saves a configuration snapshot. Use `--key` to reuse a private key when repeating
+an HMAC release; otherwise each run gets a new key.
+
+For a multi-seed study:
 
 ```powershell
-python src\experiment_cli.py run --seed 7 --events 2500 --attacks none
+python src/evaluate.py --seeds 7,42,101 --events 3000 --experiments none,all
 ```
 
-Change the IAM population or name a run yourself. Devices must be at least the
-number of users:
+Studies save measurements, means, sample standard deviations, paired differences
+from RAW, and timings under `data/studies/`. Undefined observations are excluded
+from averages; check the measured count `n`.
+
+## Files and results
+
+| Location | Contents |
+| --- | --- |
+| `src/` | Event generation, transforms, correlation, scoring and CLI runners |
+| `configs/` | Privacy policies, detector rules and attack settings |
+| `ui/src/pages/` | One JSX file per tab |
+| `ui/src/shared.jsx` | Shared UI components and helpers |
+| `ui/src/style.css` | All dashboard styles |
+| `ui/*.py` | Local API, event queries, alert views and Python charts |
+| `tests/`, `ui/tests/` | Backend and dashboard checks |
+| `assets/` | Logos and architecture diagrams |
+| `docs/validation/` | Archived evaluation CSVs |
+| `data/runs/<run-id>/` | Isolated experiment inputs, releases, labels and results |
+| `data/keys/` | Private HMAC keys |
+
+Each run includes `config.json`, `configs/`, `data_source.json`, `status.json`,
+and `results/utility.csv`, `privacy.csv`, `cost.csv`, and
+`transformation_cost.csv`. Existing runs are not overwritten.
+`python src/experiment_cli.py clean` removes run outputs and generated keys after
+confirmation; study summaries remain.
+
+## Interpreting results
+
+HMAC retains stable relationships but does not guarantee anonymity. Retained
+behavior and stable tokens can still identify or link users. The source is a
+bounded RBA sample enriched with synthetic behavior; privacy attacks use a
+same-dataset RAW reference. These results do not establish production detection
+accuracy or privacy guarantees. Keep keys, RAW releases and ground truth private.
+
+See [experiment definitions](docs/experiment_contract.md) for metric denominators
+and assumptions, and [evaluation results](docs/evaluation.md) for the archived
+study. The [architecture diagram](assets/architecture.png) provides an overview.
+
+## Checks
 
 ```powershell
-python src\experiment_cli.py run --seed 11 --events 4000 --users 25 --devices 40 --run-id study_a
-```
-
-Choose result arms. `raw`, `masked`, and `hmac` are available:
-
-```powershell
-python src\experiment_cli.py run --seed 11 --arms masked,hmac
-```
-
-To make an HMAC experiment byte-for-byte repeatable across separate runs, reuse
-the same private key:
-
-```powershell
-python src\experiment_cli.py run --seed 42 --events 3000 --key data\keys\my_experiment.key
-```
-
-## Outputs
-
-A run such as `data/runs/seed42_events3000_20260905_120000/` contains:
-
-- `config.json`: complete experiment settings and paths
-- `generated/`: normal and attack-injected Entra-like sign-in events
-- `ground_truth/`: sidecar labels used only for evaluation
-- `normalized/`: OCSF Authentication events
-- `releases/`: selected RAW, MASKED, and HMAC telemetry arms
-- `correlated/`: incident hypotheses for utility evaluation
-- `privacy_attacks/`: attacker guesses and snapshot-link results
-- `results/utility.csv`: correlation utility metrics
-- `results/privacy.csv`: privacy-risk metrics
-
-Per-run HMAC keys are placed in `data/keys/` and should remain private. They are
-not version controlled.
-
-## Manage Experiment Data
-
-List isolated runs:
-
-```powershell
-python src\experiment_cli.py list
-```
-
-Clear isolated run files and their generated keys. The command asks for confirmation:
-
-```powershell
-python src\experiment_cli.py clean
-```
-
-For automated cleanup:
-
-```powershell
-python src\experiment_cli.py clean --yes
-```
-
-## Running Individual Scripts
-
-These command runs
-the full pipeline with the default seed and attack set:
-
-```powershell
-python src\data_builder.py
-python src\attack_injector.py --attacks all
-python src\ocsf_normalizer.py
-python src\transforms.py
-python src\correlation.py
-python src\utility_metrics.py
-python src\privacy_attacks.py
-python src\privacy_metrics.py
-```
-
-## Tests
-
-```powershell
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests
+python -m unittest discover -s ui/tests
+node --test ui/tests/pages.test.mjs ui/tests/shared.test.mjs
+npm --prefix ui run build
 ```
